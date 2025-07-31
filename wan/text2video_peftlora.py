@@ -9,15 +9,12 @@ import types
 from contextlib import contextmanager
 from functools import partial
 
-import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
-from .modules.clip import CLIPModel
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
@@ -27,9 +24,11 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from diffusers import FlowMatchEulerDiscreteScheduler
+from .lora_adapters import load_peft_adapter
 
 
-class WanI2V:
+class WanT2V:
 
     def __init__(
         self,
@@ -41,11 +40,12 @@ class WanI2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
-        init_on_cpu=True,
-        model_ckpt_path=None
+        model_ckpt_path=None,
+        lora_paths=None,
+        nocfg_lora_weight=4,
     ):
         r"""
-        Initializes the image-to-video generation model components.
+        Initializes the Wan text-to-video generation model components.
 
         Args:
             config (EasyDict):
@@ -64,13 +64,10 @@ class WanI2V:
                 Enable distribution strategy of USP.
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
-            init_on_cpu (`bool`, *optional*, defaults to True):
-                Enable initializing Transformer Model on CPU. Only works without FSDP or USP.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
-        self.use_usp = use_usp
         self.t5_cpu = t5_cpu
 
         self.num_train_timesteps = config.num_train_timesteps
@@ -93,19 +90,95 @@ class WanI2V:
             device=self.device,
         )
 
-        self.clip = CLIPModel(
-            dtype=config.clip_dtype,
-            device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer),
-        )
-
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
-        self.model.eval().requires_grad_(False)
+        gc.collect()
 
-        if t5_fsdp or dit_fsdp or use_usp:
-            init_on_cpu = False
+        # if lora:
+        #     from peft import LoraConfig, get_peft_model
+
+        #     # LoRA
+        #     lora_config = LoraConfig(
+        #         r=128,
+        #         target_modules=[
+        #             "ffn.0",
+        #             "ffn.2",
+        #             "self_attn.q",
+        #             "self_attn.k",
+        #             "self_attn.v",
+        #             "self_attn.o",
+        #             "time_embedding.0",
+        #             "time_embedding.2",
+        #             "time_projection.1"
+        #         ]
+        #     )
+    
+        #     self.model = get_peft_model(self.model, lora_config)
+    
+        # if model_ckpt_path is not None:
+        #     logging.info(f"\n\n LOADING CUSTOM WEIGHTS from {model_ckpt_path}\n\n")
+        #     weights = torch.load(model_ckpt_path, map_location="cpu", mmap=True, weights_only=False) #["dit"]
+        #     self.model.load_state_dict(weights, strict=False)
+        
+        if model_ckpt_path is not None:
+            # # target_modules = [
+            # #     "ffn.0", "ffn.2",
+            # #     "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            # #     "time_embedding.0", "time_embedding.2", "time_projection.1"
+            # # ]
+
+            # target_modules= ["time_embedding.0", "time_embedding.2", "time_projection.1",]
+            # for i in range(40):  # For all 40 blocks
+            #     target_modules.extend([
+            #         f"blocks.{i}.ffn.0", f"blocks.{i}.ffn.2",
+            #         f"blocks.{i}.self_attn.q", f"blocks.{i}.self_attn.k",
+            #         f"blocks.{i}.self_attn.v", f"blocks.{i}.self_attn.o",
+            #     ])
+            
+            # nocfg_lora_config = LoraConfig(
+            #     r=128,
+            #     lora_alpha=8,
+            #     target_modules=target_modules,
+            # )
+
+            if lora_paths is not None:
+                nocfg_adapter_names = ["nocfg", "nocfg_camera"] 
+                nocfg_lora_weights = [1, nocfg_lora_weight]
+            else:
+                nocfg_adapter_names = ["nocfg",]
+                nocfg_lora_weights = [1,]  
+            for nocfg_adapter_name, nocfg_w in zip(nocfg_adapter_names, nocfg_lora_weights):
+                self.model, adapter_name = load_peft_adapter(
+                    self.model, model_ckpt_path,
+                    adapter_config=None,
+                    adapter_name=nocfg_adapter_name,
+                    lora_weight=nocfg_w,
+                    load_all_dict=False,
+                    r=128,
+                    lora_alpha=8, # !!!!!!!!!!
+                )
+        
+        if lora_paths is not None:
+            self.adaptername2paths = {}
+            # if isinstance(lora_configs, list):
+            #     if len(lora_configs) != len(lora_paths):
+            #         raise ValueError("Number of LORA configs must match number of LORA paths")
+            # else:
+            #     lora_configs = [lora_configs] * len(lora_paths)
+
+            for i, path in enumerate(lora_paths):
+                if path == '': continue
+                self.model, adapter_name = load_peft_adapter(
+                    self.model, path,
+                    adapter_config=None,
+                    adapter_name=None,
+                    lora_weight=1,
+                    load_all_dict=False
+                )
+                self.adaptername2paths[adapter_name] = path
+
+
+        self.model.eval().requires_grad_(False)
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -129,40 +202,35 @@ class WanI2V:
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
-            if not init_on_cpu:
-                self.model.to(self.device)
+            self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def generate(
         self,
         input_prompt,
-        img,
-        max_area=720 * 1280,
+        size=(1280, 720),
         frame_num=81,
         shift=5.0,
         sample_solver="unipc",
-        sampling_steps=40,
+        sampling_steps=50,
         guide_scale=5.0,
         n_prompt="",
         seed=-1,
         offload_model=True,
     ):
         r"""
-        Generates video frames from input image and text prompt using diffusion process.
+        Generates video frames from text prompt using diffusion process.
 
         Args:
             input_prompt (`str`):
-                Text prompt for content generation.
-            img (PIL.Image.Image):
-                Input image tensor. Shape: [3, H, W]
-            max_area (`int`, *optional*, defaults to 720*1280):
-                Maximum pixel area for latent space calculation. Controls video resolution scaling
+                Text prompt for content generation
+            size (tupele[`int`], *optional*, defaults to (1280,720)):
+                Controls video resolution, (width,height).
             frame_num (`int`, *optional*, defaults to 81):
                 How many frames to sample from a video. The number should be 4n+1
             shift (`float`, *optional*, defaults to 5.0):
                 Noise schedule shift parameter. Affects temporal dynamics
-                [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
             sample_solver (`str`, *optional*, defaults to 'unipc'):
                 Solver used to sample the video.
             sampling_steps (`int`, *optional*, defaults to 40):
@@ -172,7 +240,7 @@ class WanI2V:
             n_prompt (`str`, *optional*, defaults to ""):
                 Negative prompt for content exclusion. If not given, use `config.sample_neg_prompt`
             seed (`int`, *optional*, defaults to -1):
-                Random seed for noise generation. If -1, use random seed
+                Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
 
@@ -181,79 +249,34 @@ class WanI2V:
                 Generated video frames tensor. Dimensions: (C, N H, W) where:
                 - C: Color channels (3 for RGB)
                 - N: Number of frames (81)
-                - H: Frame height (from max_area)
-                - W: Frame width from max_area)
+                - H: Frame height (from size)
+                - W: Frame width from size)
         """
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-
+        # preprocess
         F = frame_num
-        h, w = img.shape[1:]
-        aspect_ratio = h / w
-        lat_h = round(
-            np.sqrt(max_area * aspect_ratio)
-            // self.vae_stride[1]
-            // self.patch_size[1]
-            * self.patch_size[1]
-        )
-        lat_w = round(
-            np.sqrt(max_area / aspect_ratio)
-            // self.vae_stride[2]
-            // self.patch_size[2]
-            * self.patch_size[2]
-        )
-        h = lat_h * self.vae_stride[1]
-        w = lat_w * self.vae_stride[2]
-
-        max_seq_len = (
-            ((F - 1) // self.vae_stride[0] + 1)
-            * lat_h
-            * lat_w
-            // (self.patch_size[1] * self.patch_size[2])
-        )
-        max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-
-        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-        noise = torch.randn(
-            16,
-            21,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device,
+        target_shape = (
+            self.vae.model.z_dim,
+            (F - 1) // self.vae_stride[0] + 1,
+            size[1] // self.vae_stride[1],
+            size[0] // self.vae_stride[2],
         )
 
-        # msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
-        latent_frame_num = (F - 1) // self.vae_stride[0] + 1
-        noise = torch.randn(
-            16,
-            latent_frame_num,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device,
+        seq_len = (
+            math.ceil(
+                (target_shape[2] * target_shape[3])
+                / (self.patch_size[1] * self.patch_size[2])
+                * target_shape[1]
+                / self.sp_size
+            )
+            * self.sp_size
         )
-
-        # msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
-        msk = torch.ones(
-            1, F, lat_h, lat_w, device=self.device
-        )  # 20250226 pftq: Fixed frames being hardcoded as 81
-
-        msk[:, 1:] = 0
-        msk = torch.concat(
-            [torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1
-        )
-        # msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.view(1, latent_frame_num, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device=self.device)
+        seed_g.manual_seed(seed)
 
-        # preprocess
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -266,28 +289,17 @@ class WanI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        self.clip.model.to(self.device)
-        clip_context = self.clip.visual([img[:, None, :, :]])
-        if offload_model:
-            self.clip.model.cpu()
-
-        y = self.vae.encode(
-            [
-                torch.concat(
-                    [
-                        torch.nn.functional.interpolate(
-                            img[None].cpu(), size=(h, w), mode="bicubic"
-                        ).transpose(0, 1),
-                        # torch.zeros(3, 80, h, w)
-                        torch.zeros(
-                            3, F - 1, h, w
-                        ),  # 20250226 pftq: fixed 80 being hardcoded frame-1
-                    ],
-                    dim=1,
-                ).to(self.device)
-            ],
-        )[0]
-        y = torch.concat([msk, y])
+        noise = [
+            torch.randn(
+                target_shape[0],
+                target_shape[1],
+                target_shape[2],
+                target_shape[3],
+                dtype=torch.float32,
+                device=self.device,
+                generator=seed_g,
+            )
+        ]
 
         @contextmanager
         def noop_no_sync():
@@ -318,76 +330,78 @@ class WanI2V:
                 timesteps, _ = retrieve_timesteps(
                     sample_scheduler, device=self.device, sigmas=sampling_sigmas
                 )
+            elif sample_solver == 'euler':
+                sample_scheduler = FlowMatchEulerDiscreteScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                    # stochastic_sampling=stochastic_sampling
+                )
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(
+                    sample_scheduler,
+                    device=self.device,
+                    sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latent = noise
+            latents = noise
 
-            arg_c = {
-                "context": [context[0]],
-                "clip_fea": clip_context,
-                "seq_len": max_seq_len,
-                "y": [y],
-            }
+            arg_c = {"context": context, "seq_len": seq_len}
+            arg_null = {"context": context_null, "seq_len": seq_len}
 
-            arg_null = {
-                "context": context_null,
-                "clip_fea": clip_context,
-                "seq_len": max_seq_len,
-                "y": [y],
-            }
-
-            if offload_model:
-                torch.cuda.empty_cache()
-
-            self.model.to(self.device)
             for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
+                latent_model_input = latents
                 timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                timestep = torch.stack(timestep)
+                # print(os.system('nvidia-smi'))
+                self.model.to(self.device)
+                # print('\nafter model on device\n' )
+                # print( os.system('nvidia-smi'))
+                # noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0]
+                # noise_pred_uncond = self.model(
+                #     latent_model_input, t=timestep, **arg_null
+                # )[0]
 
-                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[
-                    0
-                ].to(torch.device("cpu") if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null
-                )[0].to(torch.device("cpu") if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond
-                )
+                # noise_pred = noise_pred_uncond + guide_scale * (
+                #     noise_pred_cond - noise_pred_uncond
+                # )
 
-                latent = latent.to(
-                    torch.device("cpu") if offload_model else self.device
-                )
+                noise_pred = self.model(
+                    latent_model_input,
+                    t=timestep,
+                    **arg_c,
+                )[0]
+
+                if guide_scale > 1.0:
+                    noise_pred_uncond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_null,
+                    )[0]
+
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred - noise_pred_uncond
+                    )
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
-                    latent.unsqueeze(0),
+                    latents[0].unsqueeze(0),
                     return_dict=False,
                     generator=seed_g,
                 )[0]
-                latent = temp_x0.squeeze(0)
+                latents = [temp_x0.squeeze(0)]
 
-                x0 = [latent.to(self.device)]
-                del latent_model_input, timestep
-
+            x0 = latents
             if offload_model:
                 self.model.to("cpu")
-                torch.cuda.empty_cache()
-
             if self.rank == 0:
-                videos = self.vae.decode(
-                    x0,
-                )
+                videos = self.vae.decode(x0)
 
-        del noise, latent
+        del noise, latents
         del sample_scheduler
         if offload_model:
             gc.collect()

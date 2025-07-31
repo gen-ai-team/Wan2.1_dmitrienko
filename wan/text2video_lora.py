@@ -26,6 +26,99 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+from typing import Optional, List, Union, List
+from safetensors.torch import load_file
+from peft import LoraConfig, inject_adapter_in_model, get_peft_model, PeftModel
+
+def load_peft_adapter(
+    model: torch.nn.Module,
+    adapter_path: str,
+    adapter_config: Optional[LoraConfig] = None,
+    adapter_name: str = "default",
+    strict: bool = False,
+    rank: int = 0
+) -> PeftModel:
+    """
+    Загружает PEFT адаптер в модель с обработкой различных форматов
+    
+    Args:
+        model: Базовая модель
+        adapter_path: Путь к адаптеру (.pt/.safetensors)
+        adapter_config: Конфиг LoRA (если None, будет загружен из файла)
+        adapter_name: Имя адаптера (для множественных адаптеров)
+        strict: Строгая загрузка весов
+    """
+    try:
+        # Загрузка конфига, если не предоставлен
+        if adapter_config is None:
+            adapter_config = LoraConfig.from_pretrained(adapter_path)
+        
+        # Инициализация PEFT модели
+        if not isinstance(model, PeftModel):
+            model = get_peft_model(
+                model, adapter_config,
+                adapter_name=adapter_name,
+            )
+        else:
+            while adapter_name in model.peft_config:
+                if adapter_name.endswith("_1"):
+                    adapter_name[-1] = int(adapter_name[-1]) + 1
+                else:
+                    adapter_name += "_1"
+            model.add_adapter(adapter_name, adapter_config)
+        
+        # Загрузка весов адаптера
+        if adapter_path.endswith(".safetensors"):
+            adapter_state_dict = load_file(adapter_path)
+        else:
+            adapter_state_dict = torch.load(adapter_path, map_location="cpu", weights_only=True)
+        
+        # Нормализация ключей (только там где есть lora)
+        normalized_state_dict = {}
+        num_i = 0
+        for k, v in adapter_state_dict.items():
+            if 'lora' in k:
+                new_key = k
+                
+                if "diffusion_model." in new_key:
+                    if  "base_model.model." not in new_key:
+                        new_key = new_key.replace("diffusion_model.", "base_model.model.")
+                    else:
+                        new_key = new_key.replace("diffusion_model.", "")
+                if (
+                    (".default.weight" not in new_key and f".{adapter_name}.weight" not in new_key)
+                    and  (new_key.split(".")[-2] == 'lora_A' or new_key.split(".")[-2] == 'lora_B')
+                ):
+                    new_key = new_key.replace(".weight", f".{adapter_name}.weight")
+
+                elif  f".{adapter_name}.weight" not in new_key and ".default.weight" in new_key:
+                    new_key = new_key.replace(".default.weight", f".{adapter_name}.weight")
+                    
+                if not rank and num_i < 20 : print(f'k={k} --> new_key={new_key}')
+                normalized_state_dict[new_key] = v
+                num_i += 1
+    
+        # Загрузка всех весов
+        # load_result = model.load_state_dict(normalized_state_dict, strict=strict)
+        # if len(load_result.missing_keys) > 0:
+        #     logging.warning(f"Missing keys: {[k for i, k in enumerate(load_result.missing_keys) if ('lora' in k and i < 50)]}")
+        # if len(load_result.unexpected_keys) > 0:
+        #     logging.warning(f"Unexpected keys: {[k for i, k in enumerate(load_result.unexpected_keys) if (i < 50)] }")
+        
+        # Загружаем веса с преобразованием имен
+        if not rank : print([k for i, k in enumerate(model.state_dict().keys()) if i < 15 ])
+        for key, value in normalized_state_dict.items():
+            # k base_model.model.time_embedding.0.lora_A.default.weight
+            # model.state_dict(): 'base_model.model.time_embedding.0.lora_A.cfg_lora.weight'
+            
+            model.state_dict()[key].copy_(value)
+
+        return model
+        
+    except Exception as e:
+        logging.error(f"Error loading adapter {adapter_path}: {str(e)}")
+        raise
+
 
 class WanT2V:
 
@@ -40,7 +133,10 @@ class WanT2V:
         use_usp=False,
         t5_cpu=False,
         model_ckpt_path=None,
-        lora=False,
+        # for LoRas
+        lora_paths: List[str] = [],
+        lora_configs: Optional[Union[List[LoraConfig], LoraConfig]] = None,
+        lora_weights: List[str] = None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -92,31 +188,101 @@ class WanT2V:
         self.model = WanModel.from_pretrained(checkpoint_dir)
         gc.collect()
 
-        if lora:
-            from peft import LoraConfig, get_peft_model
+        # noCFG LoRa
+        self.nocfg_rank = 128
+        self.nocfg_lora_modules = [
+            "ffn.0", "ffn.2",
+            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            "time_embedding.0", "time_embedding.2", "time_projection.1",
+        ]
+        self.nocfg_merge = True # False
 
-            # LoRA
-            lora_config = LoraConfig(
-                r=128,
-                target_modules=[
-                    "ffn.0",
-                    "ffn.2",
-                    "self_attn.q",
-                    "self_attn.k",
-                    "self_attn.v",
-                    "self_attn.o",
-                    "time_embedding.0",
-                    "time_embedding.2",
-                    "time_projection.1"
-                ]
-            )
-    
-            self.model = get_peft_model(self.model, lora_config)
-    
+        # Загрузка основного чекпоинта (если указан)
         if model_ckpt_path is not None:
-            logging.info(f"\n\n LOADING CUSTOM WEIGHTS from {model_ckpt_path}\n\n")
-            weights = torch.load(model_ckpt_path, map_location="cpu", mmap=True, weights_only=False) #["dit"]
-            self.model.load_state_dict(weights, strict=False)    
+            logging.info(f"Loading custom weights from {model_ckpt_path}")
+            weights = torch.load(model_ckpt_path, map_location="cpu")
+            
+            # Проверяем, содержит ли чекпоинт LoRA адаптер
+            if any("lora" in k.lower() for k in weights.keys()):
+                model_ckpt_lora_config = LoraConfig(
+                    r=self.nocfg_rank,
+                    target_modules=self.nocfg_lora_modules,
+                    exclude_modules="vace_blocks",
+                    inference_mode=True, 
+                )
+                self.model = load_peft_adapter(
+                    self.model,
+                    model_ckpt_path,
+                    adapter_config=model_ckpt_lora_config,
+                    strict=False,
+                    adapter_name="cfg_lora", rank=rank
+                )
+                # Merge lora into model
+                if self.nocfg_merge:
+                    self.model.merge_and_unload()
+                    if hasattr(self.model, "base_model"):
+                        self.model = getattr(self.model.base_model, "model", self.model.base_model)
+                    if rank == 0:
+                        torch.save(self.model.state_dict(), "/home/jovyan/dmitrienko/workspace/checkpoints/pretrained/wan21_t2v_nocfg.pt")
+                    dist.barrier()
+            else:
+                self.model.load_state_dict(weights, strict=False)
+
+        # Загрузка дополнительных LoRA адаптеров
+        if len(lora_paths):
+            if isinstance(lora_configs, list):
+                if len(lora_configs) != len(lora_paths):
+                    raise ValueError("Number of LORA configs must match number of LORA paths")
+            else:
+                lora_configs = [lora_configs] * len(lora_paths)
+
+            for i, (path, lora_config) in enumerate(zip(lora_paths, lora_configs)):
+                if path == '': continue
+                if lora_config is None:
+                    lora_weights = torch.load(path, map_location="cpu")
+                    if any("time_projection." in k.lower() for k in lora_weights.keys()):
+                        # Дефолтный конфиг, если не предоставлен
+                        target_modules=[
+                            "ffn.0", "ffn.2",
+                            "self_attn.q", "self_attn.k","self_attn.v", "self_attn.o",
+                            "time_embedding.0", "time_embedding.2", "time_projection.1",
+                        ]
+                    else:
+                        target_modules=[
+                            "ffn.0", "ffn.2",
+                            "self_attn.q", "self_attn.k","self_attn.v", "self_attn.o",
+                            "cross_attn.q", "cross_attn.k","cross_attn.v", "cross_attn.o",
+                        ]
+                    lora_config = LoraConfig(
+                        r=128, target_modules=target_modules,
+                        inference_mode=True,
+                        exclude_modules="vace_blocks",
+                    )
+                self.model = load_peft_adapter(
+                    self.model,
+                    path,
+                    adapter_config=lora_config,
+                    adapter_name=f"lora_{i}",
+                    # is_trainable=False,
+                    strict=False, rank=rank
+                )
+        
+        # Активация всех адаптеров (если их несколько)
+        if len(lora_paths) > 0 and isinstance(self.model, PeftModel):
+            all_adapters = [adapter_name for adapter_name in self.model.peft_config.keys()]
+            logging.info(f"Activating all adapters: {all_adapters}")
+            # self.model.set_adapter(all_adapters) TypeError: unhashable type: 'list'
+            # self.model.enable_adapters() AttributeError: 'PeftModel' object has no attribute 'enable_adapters'
+            lora_weights = [1]*len(lora_paths) if lora_weights is None else lora_weights
+            self.adapter_name = "merge"
+            self.model.add_weighted_adapter(
+                adapters=all_adapters,
+                weights=lora_weights,
+                adapter_name=adapter_name,
+                combination_type="linear",
+                density=1
+            )
+            self.model.set_adapter(self.adapter_name)
 
         self.model.eval().requires_grad_(False)
 

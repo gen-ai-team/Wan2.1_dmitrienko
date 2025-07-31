@@ -1,7 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
 import gc
-import os
 import os.path as osp
 import sys
 import warnings
@@ -11,8 +10,7 @@ import gradio as gr
 warnings.filterwarnings('ignore')
 
 # Model
-sys.path.insert(
-    0, os.path.sep.join(osp.realpath(__file__).split(os.path.sep)[:-2]))
+sys.path.insert(0, '/'.join(osp.realpath(__file__).split('/')[:-2]))
 import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
@@ -81,7 +79,6 @@ def load_model(value):
             )
             print("done", flush=True)
             return '480P'
-    return value
 
 
 def prompt_enc(prompt, img, tar_lang):
@@ -174,9 +171,9 @@ def gradio_interface():
                     placeholder="Describe the video you want to generate",
                 )
                 tar_lang = gr.Radio(
-                    choices=["ZH", "EN"],
+                    choices=["CH", "EN"],
                     label="Target language of prompt enhance",
-                    value="ZH")
+                    value="CH")
                 run_p_button = gr.Button(value="Prompt Enhance")
 
                 with gr.Accordion("Advanced Options", open=True):
